@@ -146,6 +146,12 @@ def rewrite_html(html: str, base: str) -> str:
     inject = soup.new_tag('script')
     inject.string = _CLIENT_SHIM.replace('__BASE__', base)
     if soup.head:
+        # ensure a mobile-friendly viewport so proxied layouts don't collapse
+        if not soup.head.find('meta', attrs={'name': 'viewport'}):
+            vp = soup.new_tag('meta')
+            vp['name'] = 'viewport'
+            vp['content'] = 'width=device-width, initial-scale=1'
+            soup.head.insert(0, vp)
         soup.head.insert(0, inject)
     elif soup.body:
         soup.body.insert(0, inject)
@@ -158,21 +164,45 @@ def rewrite_html(html: str, base: str) -> str:
 _CLIENT_SHIM = r"""
 (function(){
   var BASE = "__BASE__";
+  // 1) Force "online" so SPAs (YouTube etc.) don't show an offline screen
+  try { Object.defineProperty(navigator, 'onLine', { get: function(){ return true; }, configurable: true }); } catch(e){}
+  window.addEventListener('offline', function(e){ e.stopImmediatePropagation(); }, true);
+
   function abs(u){ try { return new URL(u, BASE).href; } catch(e){ return u; } }
   function isProxied(u){ return typeof u === 'string' && u.indexOf('/p/') === 0; }
+  function b64(s){ return btoa(unescape(encodeURIComponent(s))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
   function pfx(u){
     if(!u || typeof u !== 'string') return u;
     var low = u.toLowerCase();
     if(low.startsWith('data:')||low.startsWith('blob:')||low.startsWith('javascript:')||low.startsWith('#')||isProxied(u)) return u;
-    try { return '/p/' + btoa(unescape(encodeURIComponent(abs(u)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
-    catch(e){ return u; }
+    try { return '/p/' + b64(abs(u)); } catch(e){ return u; }
   }
-  // fetch
+  // 2) fetch (handles string + Request)
   var _f = window.fetch;
-  if(_f){ window.fetch = function(i, init){ try{ if(typeof i === 'string') i = pfx(i); else if(i && i.url) i = new Request(pfx(i.url), i); }catch(e){} return _f.call(this, i, init); }; }
-  // XHR
+  if(_f){ window.fetch = function(i, init){
+    try{ if(typeof i === 'string') i = pfx(i); else if(i && i.url) i = new Request(pfx(i.url), i); }catch(e){}
+    return _f.call(this, i, init);
+  }; }
+  // 3) XHR
   var _o = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(m, u){ try{ arguments[1] = pfx(u); }catch(e){} return _o.apply(this, arguments); };
+  // 4) sendBeacon
+  if(navigator.sendBeacon){ var _b = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function(u, d){ try{ u = pfx(u); }catch(e){} return _b(u, d); }; }
+  // 5) dynamic <img>/<script> src assignment
+  ['src','href'].forEach(function(prop){
+    ['HTMLImageElement','HTMLScriptElement','HTMLLinkElement','HTMLMediaElement'].forEach(function(cn){
+      try{
+        var C = window[cn]; if(!C) return;
+        var d = Object.getOwnPropertyDescriptor(C.prototype, prop); if(!d || !d.set) return;
+        Object.defineProperty(C.prototype, prop, {
+          get: d.get,
+          set: function(v){ try{ v = pfx(v); }catch(e){} return d.set.call(this, v); },
+          configurable: true
+        });
+      }catch(e){}
+    });
+  });
 })();
 """
 
@@ -181,8 +211,11 @@ _CLIENT_SHIM = r"""
 def is_html(ct: str) -> bool:
     return 'text/html' in ct or 'application/xhtml' in ct
 
-def is_css(ct: str) -> bool:
-    return 'text/css' in ct
+def is_css(ct: str, target: str = '') -> bool:
+    if 'text/css' in ct:
+        return True
+    path = urlparse(target).path.lower()
+    return path.endswith('.css') and ('text/' in ct or 'octet-stream' in ct or ct == '')
 
 # ---- Core proxy ----
 
@@ -225,7 +258,7 @@ def do_proxy(target: str):
     if is_html(ct):
         body = rewrite_html(upstream.text, target)
         resp = Response(body, status=upstream.status_code, content_type='text/html; charset=utf-8')
-    elif is_css(ct):
+    elif is_css(ct, target):
         body = rewrite_css(upstream.text, target)
         resp = Response(body, status=upstream.status_code, content_type=ct)
     else:
