@@ -1,6 +1,6 @@
 import base64
 import re
-from urllib.parse import urljoin, urlparse, quote, unquote
+from urllib.parse import urljoin, urlparse, quote, unquote, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -203,6 +203,33 @@ _CLIENT_SHIM = r"""
       }catch(e){}
     });
   });
+  // 6) SPA navigation: keep history + location inside the proxy
+  function toProxyPath(u){
+    try{
+      var p = pfx(u);
+      return p; // already like /p/<token>
+    }catch(e){ return u; }
+  }
+  var _ps = history.pushState, _rs = history.replaceState;
+  history.pushState = function(s, t, u){
+    if(u){ try{ u = toProxyPath(u); }catch(e){} }
+    return _ps.call(this, s, t, u);
+  };
+  history.replaceState = function(s, t, u){
+    if(u){ try{ u = toProxyPath(u); }catch(e){} }
+    return _rs.call(this, s, t, u);
+  };
+  // intercept clicks on links the SPA may fully navigate
+  document.addEventListener('click', function(ev){
+    var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+    if(!a) return;
+    var href = a.getAttribute('href') || '';
+    if(href.indexOf('/p/') === 0 || href.startsWith('#') || href.startsWith('javascript:')) return;
+    // bare or absolute link that escaped rewriting -> fix it
+    if(href.startsWith('/') || href.startsWith('http')){
+      a.setAttribute('href', pfx(href));
+    }
+  }, true);
 })();
 """
 
@@ -219,17 +246,87 @@ def is_css(ct: str, target: str = '') -> bool:
 
 # ---- Core proxy ----
 
+def _extract_video_id(target: str):
+    u = urlparse(target)
+    host = u.netloc.lower()
+    if host.endswith('youtu.be'):
+        vid = u.path.strip('/').split('/')[0]
+        return vid or None
+    if 'youtube.com' in host:
+        if u.path == '/watch':
+            qs = parse_qs(u.query)
+            v = qs.get('v', [''])[0]
+            return v or None
+        if u.path.startswith('/shorts/'):
+            return u.path.split('/shorts/')[1].split('/')[0] or None
+        if u.path.startswith('/embed/'):
+            return u.path.split('/embed/')[1].split('/')[0] or None
+    return None
+
+_EMBED_PAGE = """<!DOCTYPE html>
+<html lang="ja"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Player</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+  .bar{display:flex;align-items:center;gap:12px;padding:10px 14px;background:#0f0f0f;color:#fff}
+  .bar a{color:#8ab4ff;text-decoration:none;font-size:.9rem}
+  .bar .t{color:#aaa;font-size:.8rem;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .wrap{position:relative;width:100%;padding-top:56.25%;background:#000}
+  .wrap iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+  .note{color:#888;font-size:.8rem;padding:12px 14px;line-height:1.5}
+</style></head><body>
+  <div class="bar">
+    <a href="__BACK__">&larr; 戻る</a>
+    <span class="t">YouTube Player</span>
+  </div>
+  <div class="wrap">
+    <iframe src="https://www.youtube-nocookie.com/embed/__VID__?autoplay=1&playsinline=1"
+            allow="accelerator; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            referrerpolicy="strict-origin-when-cross-origin"
+            allowfullscreen></iframe>
+  </div>
+  <div class="note">公式の埋め込みプレーヤーで直接再生しています。埋め込みが無効な動画・年齢制限付きの動画は再生できません。</div>
+</body></html>"""
+
+def render_youtube_embed(video_id: str, origin: str) -> Response:
+    # back link: proxied YouTube home so the rest of the UI still works
+    back = proxied(origin.rstrip('/') + '/')
+    html = _EMBED_PAGE.replace('__VID__', video_id).replace('__BACK__', back)
+    return Response(html, content_type='text/html; charset=utf-8')
+
 def do_proxy(target: str):
     parsed = urlparse(target)
     if parsed.scheme not in ('http', 'https') or not parsed.netloc:
         return Response('Invalid target URL', status=400)
 
+    # YouTube watch/shorts/youtu.be -> serve the official embed player directly.
+    # The embed iframe loads straight from YouTube (not through the proxy),
+    # so it uses the user's own IP and isn't treated as a bot.
+    vid = _extract_video_id(target)
+    if vid:
+        return render_youtube_embed(vid, f'{parsed.scheme}://{parsed.netloc}')
+
+    is_navigation = 'text/html' in request.headers.get('Accept', '')
     headers = {
         'User-Agent': UA,
-        'Accept': request.headers.get('Accept', '*/*'),
-        'Accept-Language': request.headers.get('Accept-Language', 'en-US,en;q=0.9'),
+        'Accept': request.headers.get('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'),
+        'Accept-Language': request.headers.get('Accept-Language', 'ja,en-US;q=0.9,en;q=0.8'),
         'Referer': f'{parsed.scheme}://{parsed.netloc}/',
+        'Origin': f'{parsed.scheme}://{parsed.netloc}',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document' if is_navigation else 'empty',
+        'Sec-Fetch-Mode': 'navigate' if is_navigation else 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+        'sec-ch-ua': '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
     }
+    # forward the content-type of the original request (needed for API POSTs)
+    if request.content_type:
+        headers['Content-Type'] = request.content_type
 
     try:
         upstream = requests.request(
@@ -269,6 +366,10 @@ def do_proxy(target: str):
         if h in upstream.headers:
             resp.headers[h] = upstream.headers[h]
     resp.headers['Access-Control-Allow-Origin'] = '*'
+    # remember which origin we're browsing, so bare-path navigations
+    # (e.g. SPA routes like /watch?v=...) can be recovered later.
+    resp.set_cookie('__px_origin', f'{parsed.scheme}://{parsed.netloc}',
+                    max_age=3600, samesite='Lax', path='/')
     return resp
 
 # ---- Routes ----
@@ -304,6 +405,42 @@ def home():
 @app.route('/health')
 def health():
     return {'status': 'ok'}
+
+def _origin_from_context():
+    """Recover the site being browsed from Referer (a /p/<token> URL) or cookie."""
+    ref = request.headers.get('Referer', '')
+    m = re.search(r'/p/([A-Za-z0-9_\-]+)', ref)
+    if m:
+        try:
+            u = urlparse(dec(m.group(1)))
+            if u.scheme and u.netloc:
+                return f'{u.scheme}://{u.netloc}'
+        except Exception:
+            pass
+    c = request.cookies.get('__px_origin')
+    if c and c.startswith(('http://', 'https://')):
+        return c
+    return None
+
+@app.route('/<path:subpath>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+def catchall(subpath):
+    # Bare paths that aren't /p/..., /go, /health, / — typically SPA routes
+    # like /watch?v=... that the site navigated to without our prefix.
+    origin = _origin_from_context()
+    if not origin:
+        return Response('Not found (no proxy context)', status=404)
+    target = origin.rstrip('/') + '/' + subpath
+    q = request.query_string.decode('utf-8')
+    if q:
+        target += '?' + q
+    # watch/shorts -> serve embed straight away (do_proxy handles it)
+    if _extract_video_id(target):
+        return do_proxy(target)
+    # for GET navigations, redirect so the URL bar becomes a proper /p/ link;
+    # for other methods, proxy in place to preserve the body.
+    if request.method == 'GET':
+        return redirect(proxied(target), code=302)
+    return do_proxy(target)
 
 HOME_HTML = r"""<!DOCTYPE html>
 <html lang="ja">
